@@ -1,0 +1,53 @@
+#!/bin/bash
+# Centralized log rotation for shared logs (multi-node deployments):
+# run exactly ONE instance of this container per set of shared logs.
+# It installs a cron entry at LOG_ROTATE_HOUR and keeps crond running.
+# copytruncate is used because the processes writing these logs keep
+# their file-descriptors open, so a plain rename would leave them
+# writing into the rotated file.
+function setup_logrotate {
+    local cronFile=/var/spool/cron/crontabs/root
+    # The logrotate package ships its own periodic daily job; remove it so
+    # rotation happens exclusively through the cron entry managed here.
+    rm -f /etc/periodic/daily/logrotate
+    sed -i "\#logrotate /etc/logrotate.conf#d" "$cronFile" 2>/dev/null
+    local keepDays=$LOG_ROTATE_KEEP_DAYS
+    local hour=$LOG_ROTATE_HOUR
+    local maxSize=$LOG_ROTATE_MAX_SIZE
+    [[ $keepDays =~ ^[0-9]+$ ]] || keepDays=30
+    [[ $hour =~ ^[0-9]{1,2}$ ]] && ((10#$hour <= 23)) || hour=1
+    if [[ $maxSize =~ ^([0-9]+)([kKmMgG]?)[bB]$ ]]; then
+        maxSize="${BASH_REMATCH[1]}${BASH_REMATCH[2]}" # e.g. 100MB -> 100M
+    elif ! [[ $maxSize =~ ^[0-9]+[kKmMgG]?$ ]]; then
+        maxSize=100M
+    fi
+    # LOG_ROTATE_PATTERN is a list: "*.log,*.err" (commas and spaces both work)
+    local patterns=${LOG_ROTATE_PATTERN//,/ }
+    local p
+    local -a globs=()
+    for p in $patterns; do
+        [[ $p == /* ]] && globs+=("$p") || globs+=("/var/log/$p")
+    done
+    (( ${#globs[@]} > 0 )) || globs=("/var/log/*.log" "/var/log/*.err")
+    cat > /etc/logrotate.conf <<EOF
+${globs[*]} {
+    daily
+    rotate $keepDays
+    maxsize $maxSize
+    nodateext
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    sharedscripts
+}
+EOF
+    chmod 644 /etc/logrotate.conf # logrotate rejects group-writable configs
+    echo "0 $hour * * * /usr/sbin/logrotate /etc/logrotate.conf" >> "$cronFile"
+}
+
+setup_logrotate
+
+echo "Starting crond... (daily rotation at hour $LOG_ROTATE_HOUR, keep $LOG_ROTATE_KEEP_DAYS, maxsize $LOG_ROTATE_MAX_SIZE)"
+exec crond -f
